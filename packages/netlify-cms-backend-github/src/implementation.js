@@ -2,8 +2,10 @@ import React from 'react';
 import trimStart from 'lodash/trimStart';
 import semaphore from 'semaphore';
 import { stripIndent } from 'common-tags';
+import { asyncLock } from 'netlify-cms-lib-util';
 import AuthenticationPage from './AuthenticationPage';
 import API from './API';
+import GraphQLAPI from './GraphQLAPI';
 
 const MAX_CONCURRENT_DOWNLOADS = 10;
 
@@ -50,21 +52,37 @@ export default class GitHub {
 
     this.api = this.options.API || null;
 
-    this.forkWorkflowEnabled = config.getIn(['backend', 'fork_workflow'], false);
-    if (this.forkWorkflowEnabled) {
+    this.openAuthoringEnabled = config.getIn(['backend', 'open_authoring'], false);
+    if (this.openAuthoringEnabled) {
       if (!this.options.useWorkflow) {
         throw new Error(
-          'backend.fork_workflow is true but publish_mode is not set to editorial_workflow.',
+          'backend.open_authoring is true but publish_mode is not set to editorial_workflow.',
         );
       }
       this.originRepo = config.getIn(['backend', 'repo'], '');
     } else {
-      this.repo = config.getIn(['backend', 'repo'], '');
+      this.repo = this.originRepo = config.getIn(['backend', 'repo'], '');
     }
     this.branch = config.getIn(['backend', 'branch'], 'master').trim();
     this.api_root = config.getIn(['backend', 'api_root'], 'https://api.github.com');
     this.token = '';
     this.squash_merges = config.getIn(['backend', 'squash_merges']);
+    this.use_graphql = config.getIn(['backend', 'use_graphql']);
+    this.lock = asyncLock();
+  }
+
+  async runWithLock(func, message) {
+    try {
+      const acquired = await this.lock.acquire();
+      if (!acquired) {
+        console.warn(message);
+      }
+
+      const result = await func();
+      return result;
+    } finally {
+      this.lock.release();
+    }
   }
 
   authComponent() {
@@ -74,7 +92,7 @@ export default class GitHub {
   }
 
   restoreUser(user) {
-    return this.forkWorkflowEnabled
+    return this.openAuthoringEnabled
       ? this.authenticateWithFork({ userData: user, getPermissionToFork: () => true }).then(() =>
           this.authenticate(user),
         )
@@ -86,7 +104,7 @@ export default class GitHub {
     var repoExists = false;
     while (!repoExists) {
       repoExists = await fetch(`${this.api_root}/repos/${repo}`, {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `token ${token}` },
       })
         .then(() => true)
         .catch(err => (err && err.status === 404 ? false : Promise.reject(err)));
@@ -102,7 +120,7 @@ export default class GitHub {
     if (!this._currentUserPromise) {
       this._currentUserPromise = fetch(`${this.api_root}/user`, {
         headers: {
-          Authorization: `Bearer ${token}`,
+          Authorization: `token ${token}`,
         },
       }).then(res => res.json());
     }
@@ -117,7 +135,7 @@ export default class GitHub {
         `${this.api_root}/repos/${this.originRepo}/collaborators/${username}/permission`,
         {
           headers: {
-            Authorization: `Bearer ${token}`,
+            Authorization: `token ${token}`,
           },
         },
       )
@@ -128,15 +146,15 @@ export default class GitHub {
   }
 
   async authenticateWithFork({ userData, getPermissionToFork }) {
-    if (!this.forkWorkflowEnabled) {
-      throw new Error('Cannot authenticate with fork; forking workflow is turned off.');
+    if (!this.openAuthoringEnabled) {
+      throw new Error('Cannot authenticate with fork; Open Authoring is turned off.');
     }
     const { token } = userData;
 
     // Origin maintainers should be able to use the CMS normally
     if (await this.userIsOriginMaintainer({ token })) {
       this.repo = this.originRepo;
-      this.useForkWorkflow = false;
+      this.useOpenAuthoring = false;
       return Promise.resolve();
     }
 
@@ -145,24 +163,25 @@ export default class GitHub {
     const fork = await fetch(`${this.api_root}/repos/${this.originRepo}/forks`, {
       method: 'POST',
       headers: {
-        Authorization: `Bearer ${token}`,
+        Authorization: `token ${token}`,
       },
     }).then(res => res.json());
-    this.useForkWorkflow = true;
+    this.useOpenAuthoring = true;
     this.repo = fork.full_name;
     return this.pollUntilForkExists({ repo: fork.full_name, token });
   }
 
   async authenticate(state) {
     this.token = state.token;
-    this.api = new API({
+    const apiCtor = this.use_graphql ? GraphQLAPI : API;
+    this.api = new apiCtor({
       token: this.token,
       branch: this.branch,
       repo: this.repo,
-      originRepo: this.useForkWorkflow ? this.originRepo : undefined,
+      originRepo: this.originRepo,
       api_root: this.api_root,
       squash_merges: this.squash_merges,
-      useForkWorkflow: this.useForkWorkflow,
+      useOpenAuthoring: this.useOpenAuthoring,
       initialWorkflowStatus: this.options.initialWorkflowStatus,
     });
     const user = await this.api.user();
@@ -186,11 +205,14 @@ export default class GitHub {
     }
 
     // Authorized user
-    return { ...user, token: state.token, useForkWorkflow: this.useForkWorkflow };
+    return { ...user, token: state.token, useOpenAuthoring: this.useOpenAuthoring };
   }
 
   logout() {
     this.token = null;
+    if (typeof this.api.reset === 'function') {
+      return this.api.reset();
+    }
     return;
   }
 
@@ -199,14 +221,14 @@ export default class GitHub {
   }
 
   async entriesByFolder(collection, extension) {
-    const repoURL = `/repos/${this.useForkWorkflow ? this.originRepo : this.repo}`;
-    const files = await this.api.listFiles(collection.get('folder'));
+    const repoURL = `/repos/${this.useOpenAuthoring ? this.originRepo : this.repo}`;
+    const files = await this.api.listFiles(collection.get('folder'), { repoURL });
     const filteredFiles = files.filter(file => file.name.endsWith('.' + extension));
     return this.fetchFiles(filteredFiles, { repoURL });
   }
 
   entriesByFiles(collection) {
-    const repoURL = `/repos/${this.useForkWorkflow ? this.originRepo : this.repo}`;
+    const repoURL = `/repos/${this.useOpenAuthoring ? this.originRepo : this.repo}`;
     const files = collection.get('files').map(collectionFile => ({
       path: collectionFile.get('file'),
       label: collectionFile.get('label'),
@@ -243,7 +265,7 @@ export default class GitHub {
 
   // Fetches a single entry.
   getEntry(collection, slug, path) {
-    const repoURL = `/repos/${this.useForkWorkflow ? this.originRepo : this.repo}`;
+    const repoURL = `/repos/${this.originRepo}`;
     return this.api.readFile(path, null, { repoURL }).then(data => ({
       file: { path },
       data,
@@ -253,17 +275,33 @@ export default class GitHub {
   getMedia() {
     return this.api.listFiles(this.config.get('media_folder')).then(files =>
       files.map(({ sha, name, size, download_url, path }) => {
-        const url = new URL(download_url);
-        if (url.pathname.match(/.svg$/)) {
-          url.search += (url.search.slice(1) === '' ? '?' : '&') + 'sanitize=true';
+        if (download_url) {
+          const url = new URL(download_url);
+          if (url.pathname.match(/.svg$/)) {
+            url.search += (url.search.slice(1) === '' ? '?' : '&') + 'sanitize=true';
+          }
+          // if 'displayURL' is a string it will be loaded as is
+          return { id: sha, name, size, displayURL: url.href, path };
+        } else {
+          // if 'displayURL' is not a string it will be loaded using getMediaDisplayURL
+          return { id: sha, name, size, displayURL: { sha }, path };
         }
-        return { id: sha, name, size, displayURL: url.href, path };
       }),
     );
   }
 
+  async getMediaDisplayURL(displayURL) {
+    const { sha } = displayURL;
+    const mediaURL = await this.api.getMediaDisplayURL(sha);
+    return mediaURL;
+  }
+
   persistEntry(entry, mediaFiles = [], options = {}) {
-    return this.api.persistFiles(entry, mediaFiles, options);
+    // persistEntry is a transactional operation
+    return this.runWithLock(
+      () => this.api.persistFiles(entry, mediaFiles, options),
+      'Failed to acquire persist entry lock',
+    );
   }
 
   async persistMedia(mediaFile, options = {}) {
@@ -365,7 +403,8 @@ export default class GitHub {
       return null;
     }
 
-    const statuses = await this.api.getStatuses(data.pr.head);
+    const headSHA = typeof data.pr.head === 'string' ? data.pr.head : data.pr.head.sha;
+    const statuses = await this.api.getStatuses(headSHA);
     const deployStatus = getPreviewStatus(statuses, this.config);
 
     if (deployStatus) {
@@ -375,13 +414,22 @@ export default class GitHub {
   }
 
   updateUnpublishedEntryStatus(collection, slug, newStatus) {
-    return this.api.updateUnpublishedEntryStatus(collection, slug, newStatus);
+    // updateUnpublishedEntryStatus is a transactional operation
+    return this.runWithLock(
+      () => this.api.updateUnpublishedEntryStatus(collection, slug, newStatus),
+      'Failed to acquire update entry status lock',
+    );
   }
 
   deleteUnpublishedEntry(collection, slug) {
     return this.api.deleteUnpublishedEntry(collection, slug);
   }
+
   publishUnpublishedEntry(collection, slug) {
-    return this.api.publishUnpublishedEntry(collection, slug);
+    // publishUnpublishedEntry is a transactional operation
+    return this.runWithLock(
+      () => this.api.publishUnpublishedEntry(collection, slug),
+      'Failed to acquire publish entry lock',
+    );
   }
 }

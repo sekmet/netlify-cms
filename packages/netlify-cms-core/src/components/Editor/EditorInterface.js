@@ -38,7 +38,7 @@ const ReactSplitPaneGlobalStyles = () => (
 
         &:before {
           content: '';
-          width: 1px;
+          width: 2px;
           height: 100%;
           position: relative;
           left: 10px;
@@ -83,7 +83,6 @@ const EditorContainer = styled.div`
 `;
 
 const Editor = styled.div`
-  max-width: 1600px;
   height: 100%;
   margin: 0 auto;
   position: relative;
@@ -166,7 +165,7 @@ class EditorInterface extends Component {
       hasChanged,
       displayUrl,
       hasWorkflow,
-      useForkWorkflow,
+      useOpenAuthoring,
       hasUnpublishedChanges,
       isNewEntry,
       isModification,
@@ -241,7 +240,7 @@ class EditorInterface extends Component {
           displayUrl={displayUrl}
           collection={collection}
           hasWorkflow={hasWorkflow}
-          useForkWorkflow={useForkWorkflow}
+          useOpenAuthoring={useOpenAuthoring}
           hasUnpublishedChanges={hasUnpublishedChanges}
           isNewEntry={isNewEntry}
           isModification={isModification}
@@ -257,12 +256,14 @@ class EditorInterface extends Component {
               active={previewVisible}
               onClick={this.handleTogglePreview}
               icon="eye"
+              title="Toggle preview"
             />
             <EditorToggle
               enabled={collectionPreviewEnabled && previewVisible}
               active={scrollSyncEnabled}
               onClick={this.handleToggleScrollSync}
               icon="scroll"
+              title="Sync scrolling"
             />
           </ViewControls>
           {collectionPreviewEnabled && this.state.previewVisible ? (
@@ -295,7 +296,7 @@ EditorInterface.propTypes = {
   hasChanged: PropTypes.bool,
   displayUrl: PropTypes.string,
   hasWorkflow: PropTypes.bool,
-  useForkWorkflow: PropTypes.bool,
+  useOpenAuthoring: PropTypes.bool,
   hasUnpublishedChanges: PropTypes.bool,
   isNewEntry: PropTypes.bool,
   isModification: PropTypes.bool,
